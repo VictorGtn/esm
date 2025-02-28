@@ -37,13 +37,13 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train Sparse Autoencoders on ESM model activations")
     
     # Model and data arguments
-    parser.add_argument("--model-name", type=str, default="esm2_t33_650M_UR50D",
+    parser.add_argument("--model-name", type=str, default="esmc_600m",
                         help="Name of pretrained ESM model to use")
     parser.add_argument("--data-path", type=str, required=True,
                         help="Path to file with protein sequences (one per line)")
     parser.add_argument("--output-dir", type=str, default="./sae_results",
                         help="Directory to save results")
-    parser.add_argument("--subset-size", type=int, default=1000,
+    parser.add_argument("--subset-size", type=int, default=None,
                         help="Number of sequences to use from dataset (for faster experimentation)")
     
     # Autoencoder arguments
