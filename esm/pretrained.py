@@ -1,4 +1,4 @@
-from typing import Callable
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -23,6 +23,7 @@ from esm.utils.constants.models import (
     ESMC_300M,
     ESMC_600M,
 )
+from esm.interpretability import ESMCInterpreter
 
 ModelBuilder = Callable[[torch.device | str], nn.Module]
 
@@ -138,3 +139,39 @@ def load_local_model(
 # Register custom versions of ESM3 for use with the local inference API
 def register_local_model(model_name: str, model_builder: ModelBuilder) -> None:
     LOCAL_MODEL_REGISTRY[model_name] = model_builder
+
+
+
+def load_esmc_with_interpreter(
+    model_name: str, 
+    device: torch.device = torch.device("cpu"),
+    hidden_dim: Optional[int] = None,
+    l1_coefficient: float = 1e-3,
+    use_flash_attn: bool = True
+) -> Tuple[nn.Module, ESMCInterpreter]:
+    """
+    Load an ESMC model with an attached interpreter for interpretability analysis.
+    
+    Args:
+        model_name: Name of model to load (ESMC_300M or ESMC_600M)
+        device: Device to load model on
+        hidden_dim: Hidden dimension for SAE (default: 2x model dim)
+        l1_coefficient: L1 sparsity coefficient
+        use_flash_attn: Whether to use flash attention for the model
+        
+    Returns:
+        Tuple of (model, interpreter)
+    """
+    model = load_local_model(model_name, device)
+    
+    # Only ESMC models are supported
+    if isinstance(model, ESMC):
+        interpreter = ESMCInterpreter(
+            model=model,
+            hidden_dim=hidden_dim,
+            device=device,
+            l1_coefficient=l1_coefficient
+        )
+        return model, interpreter
+    else:
+        raise ValueError(f"Model {model_name} is not an ESMC model and cannot be interpreted with ESMCInterpreter.")

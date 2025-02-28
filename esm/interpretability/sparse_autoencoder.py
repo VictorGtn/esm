@@ -13,6 +13,8 @@ class SparseAutoencoder(nn.Module):
         input_dim (int): Dimension of input activations
         hidden_dim (int): Dimension of the sparse representation (typically > input_dim)
         l1_coefficient (float): Coefficient for L1 sparsity penalty
+        use_top_k (bool): Whether to use top-k sparsity in the encoder
+        top_k_percentage (float): Percentage of features to keep active (between 0 and 1)
         dtype (torch.dtype): Data type for parameters
     """
     def __init__(
@@ -20,6 +22,8 @@ class SparseAutoencoder(nn.Module):
         input_dim: int, 
         hidden_dim: int,
         l1_coefficient: float = 1e-3,
+        use_top_k: bool = False,
+        top_k_percentage: float = 0.1,
         dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
@@ -27,6 +31,8 @@ class SparseAutoencoder(nn.Module):
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.l1_coefficient = l1_coefficient
+        self.use_top_k = use_top_k
+        self.top_k_percentage = top_k_percentage
         
         # Encoder and decoder
         self.encoder = nn.Linear(input_dim, hidden_dim, bias=True, dtype=dtype)
@@ -42,6 +48,26 @@ class SparseAutoencoder(nn.Module):
         nn.init.kaiming_normal_(self.decoder.weight, nonlinearity='linear')
         nn.init.zeros_(self.decoder.bias)
     
+    def _apply_top_k(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply top-k sparsity to each sample in the batch.
+        
+        Args:
+            x: Tensor of shape [batch_size, hidden_dim]
+            
+        Returns:
+            Tensor with only top-k values preserved
+        """
+        batch_size = x.shape[0]
+        k = max(1, int(self.top_k_percentage * self.hidden_dim))
+        
+        # Find threshold value for each sample in batch
+        values, _ = torch.topk(x, k, dim=1)
+        thresholds = values[:, -1].unsqueeze(1)  # Shape: [batch_size, 1]
+        
+        # Zero out values below the threshold
+        return x * (x >= thresholds)
+    
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through the autoencoder.
@@ -54,6 +80,10 @@ class SparseAutoencoder(nn.Module):
         """
         # Encode to get sparse features
         sparse_code = F.relu(self.encoder(x))
+        
+        # Apply top-k sparsity if enabled
+        if self.use_top_k:
+            sparse_code = self._apply_top_k(sparse_code)
         
         # Decode to reconstruct input
         reconstructed = self.decoder(sparse_code)
@@ -81,17 +111,23 @@ class SparseAutoencoder(nn.Module):
         recon_loss = F.mse_loss(reconstructed, x)
         
         # L1 sparsity loss
-        l1_loss = self.l1_coefficient * sparse_code.abs().mean()
+        l1_loss = torch.tensor(0.0, device=x.device)
+        if self.l1_coefficient > 0:
+            l1_loss = self.l1_coefficient * sparse_code.abs().mean()
         
         # Total loss
         total_loss = recon_loss + l1_loss
+        
+        # Calculate sparsity metrics
+        sparsity = (sparse_code == 0).float().mean().item()
+        mean_activation = sparse_code.abs().mean().item()
         
         return {
             "total": total_loss,
             "reconstruction": recon_loss,
             "l1_sparsity": l1_loss,
-            "mean_activation": sparse_code.abs().mean().item(),
-            "sparsity": (sparse_code == 0).float().mean().item(),
+            "mean_activation": mean_activation,
+            "sparsity": sparsity,
         }
         
     def get_feature_importance(self) -> torch.Tensor:
