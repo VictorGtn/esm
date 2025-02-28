@@ -19,8 +19,8 @@ import os
 import random
 from typing import List, Dict, Optional, Tuple
 import wandb  # Import wandb for experiment tracking
-
-from esm.pretrained import load_model_and_alphabet
+from esm.utils.constants.models import ESMC_600M, ESMC_300M
+from esm.pretrained import load_local_model
 from esm.models.esmc import ESMC
 from esm.interpretability.esmc_interpreter import ESMCInterpreter
 
@@ -127,7 +127,7 @@ def setup_interpreter(args):
     logger.info(f"Loading pretrained model: {args.model_name}")
     
     # Load model
-    model, alphabet = load_model_and_alphabet(args.model_name)
+    model = load_local_model(args.model_name, args.device)
     model = model.to(args.device)
     model.eval()  # Set to evaluation mode
     
