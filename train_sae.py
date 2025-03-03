@@ -45,6 +45,8 @@ def parse_args():
                         help="Directory to save results")
     parser.add_argument("--subset-size", type=int, default=None,
                         help="Number of sequences to use from dataset (for faster experimentation)")
+    parser.add_argument("--include-special-tokens", action="store_true",
+                        help="Include special tokens (BOS/EOS) in collected activations")
     
     # Autoencoder arguments
     parser.add_argument("--sae-hidden-dim", type=int, default=None,
@@ -189,9 +191,11 @@ def main():
         input_sequences=sequences,
         layer_indices=layer_indices,
         component=args.component,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        include_special_tokens=args.include_special_tokens
     )
     
+    logger.info(f"Total activations collected: {len(activations)}")
     # Train autoencoders for each layer
     for layer_idx in layer_indices:
         layer_key = f"layer_{layer_idx}_{args.component}"

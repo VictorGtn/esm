@@ -3,6 +3,7 @@ import torch.nn as nn
 from typing import Dict, List, Optional, Callable, Any, Union
 import numpy as np
 from collections import defaultdict
+import functools
 
 
 class ActivationCaptureHook:
@@ -41,71 +42,75 @@ class ActivationCaptureHook:
 
 class ESMCActivationCapturer:
     """
-    Utility for capturing activations from ESMC model.
+    Hooks into a ESMC model to capture activations.
     
     Args:
-        model: ESMC model instance
-        layers_to_capture: List of layer indices to capture 
-        component: Which component to capture ('attention', 'ffn', 'mlp')
+        model: ESMC model to hook into
+        layers_to_capture: List of layer indices to capture from (default: all layers)
+        component: Which component to analyze ('attention', 'mlp', 'embeddings')
     """
     def __init__(
-        self,
+        self, 
         model,
-        layers_to_capture: List[int] = None,
-        component: str = 'mlp'  # 'attention', 'mlp', 'embeddings'
+        layers_to_capture: Optional[List[int]] = None,
+        component: str = 'mlp'
     ):
         self.model = model
         self.component = component
         
+        # Default to capturing all layers if not specified
         if layers_to_capture is None:
-            # Capture all layers by default
-            layers_to_capture = list(range(len(model.transformer.layers)))
+            layers_to_capture = list(range(len(model.transformer.blocks)))
         self.layers_to_capture = layers_to_capture
         
-        self.activations = {}
+        # Store hooks and activations
         self.hooks = []
+        self.activations = {}
         
-    def attach_hooks(self):
-        """Attach hooks to the model to capture activations."""
-        # Clear any existing hooks
-        self.remove_hooks()
+    def _hook_fn(self, layer_idx: int, module: nn.Module, input: Any, output: Any) -> None:
+        """Hook function to capture activations."""
+        # Make a copy to avoid modifying the original tensor
+        self.activations[f"layer_{layer_idx}_{self.component}"] = output.detach()
         
-        # Different hook points based on the component we want to capture
-        if self.component == 'mlp':
-            # Capture MLP outputs
-            for layer_idx in self.layers_to_capture:
-                layer = self.model.transformer.layers[layer_idx]
-                hook = layer.mlp.register_forward_hook(
-                    ActivationCaptureHook(self.activations, f"layer_{layer_idx}_mlp")
-                )
-                self.hooks.append(hook)
-                
-        elif self.component == 'attention':
-            # Capture attention outputs
-            for layer_idx in self.layers_to_capture:
-                layer = self.model.transformer.layers[layer_idx]
-                hook = layer.attention.register_forward_hook(
-                    ActivationCaptureHook(self.activations, f"layer_{layer_idx}_attention")
-                )
-                self.hooks.append(hook)
-                
-        elif self.component == 'embeddings':
-            # Capture embeddings output
-            hook = self.model.embeddings.register_forward_hook(
-                ActivationCaptureHook(self.activations, "embeddings_output")
+    def attach_hooks(self) -> None:
+        """Attach hooks to the model."""
+        self.remove_hooks()  # Clear any existing hooks
+        
+        for layer_idx in self.layers_to_capture:
+            # Get the appropriate module based on the component
+            if self.component == 'mlp':
+                if hasattr(self.model.transformer.blocks[layer_idx], 'mlp'):
+                    module = self.model.transformer.blocks[layer_idx].mlp
+                else:
+                    # If direct MLP access not available, find the equivalent module
+                    module = self.model.transformer.blocks[layer_idx].ffn
+            elif self.component == 'attention':
+                module = self.model.transformer.blocks[layer_idx].attention
+            elif self.component == 'embeddings':
+                # For embeddings, we use the output of the transformer's first layer
+                if layer_idx == 0:
+                    module = self.model.embed
+                else:
+                    continue  # Skip other layers for embeddings component
+            else:
+                raise ValueError(f"Unknown component: {self.component}")
+            
+            # Register the hook
+            hook = module.register_forward_hook(
+                functools.partial(self._hook_fn, layer_idx)
             )
             self.hooks.append(hook)
     
-    def remove_hooks(self):
+    def clear_activations(self) -> None:
+        """Clear stored activations."""
+        self.activations = {}
+        
+    def remove_hooks(self) -> None:
         """Remove all hooks."""
         for hook in self.hooks:
             hook.remove()
         self.hooks = []
         
-    def get_activations(self):
+    def get_activations(self) -> Dict[str, torch.Tensor]:
         """Get the captured activations."""
-        return self.activations
-    
-    def clear_activations(self):
-        """Clear the stored activations."""
-        self.activations = {} 
+        return self.activations 

@@ -22,6 +22,8 @@ class ESMCInterpreter:
         hidden_dim: Dimension for sparse features (default: twice the model dimension)
         device: Device to use
         l1_coefficient: L1 sparsity coefficient
+        use_top_k: Whether to use top-k sparsity in the encoder
+        top_k_percentage: Percentage of features to keep active (between 0 and 1)
     """
     def __init__(
         self, 
@@ -29,14 +31,19 @@ class ESMCInterpreter:
         hidden_dim: Optional[int] = None,
         device: Optional[torch.device] = None,
         l1_coefficient: float = 1e-3,
+        use_top_k: bool = False,
+        top_k_percentage: float = 0.1,
     ):
         self.model = model
         self.device = device or next(model.parameters()).device
         
-        # Default hidden dimension to twice the model dimension
-        self.model_dim = model.d_model
+        # Get model dimension from the embedding layer since d_model isn't directly accessible
+        # The embedding dimension is the output size of the embedding layer
+        self.model_dim = model.embed.embedding_dim
         self.hidden_dim = hidden_dim or (2 * self.model_dim)
         self.l1_coefficient = l1_coefficient
+        self.use_top_k = use_top_k
+        self.top_k_percentage = top_k_percentage
         
         # Create activation capturer
         self.capturer = ESMCActivationCapturer(model)
@@ -75,6 +82,8 @@ class ESMCInterpreter:
             input_dim=input_dim,
             hidden_dim=self.hidden_dim,
             l1_coefficient=self.l1_coefficient,
+            use_top_k=self.use_top_k,
+            top_k_percentage=self.top_k_percentage,
             dtype=self.dtype
         ).to(self.device)
         
@@ -87,6 +96,7 @@ class ESMCInterpreter:
         layer_indices: List[int],
         component: str = 'mlp',
         batch_size: int = 4,
+        include_special_tokens: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Collect activations from the model for a dataset of inputs.
@@ -96,6 +106,7 @@ class ESMCInterpreter:
             layer_indices: Which layers to collect activations from
             component: Which component to analyze ('attention', 'mlp', 'embeddings')
             batch_size: Batch size for processing
+            include_special_tokens: Whether to include special tokens (BOS/EOS) in collected activations
             
         Returns:
             Dictionary mapping layer keys to tensors of activations
@@ -138,17 +149,22 @@ class ESMCInterpreter:
             
             # Forward pass with no grad
             with torch.no_grad():
-                self.model(tokens_tensor, attention_mask=attention_mask)
+                self.model(tokens_tensor)
                 
                 # Collect activations
                 activations = self.capturer.get_activations()
                 for k, v in activations.items():
                     # Extract activations, excluding padding tokens
-                    for j, seq_len in enumerate(map(len, batch_tokens)):
-                        # Get activations for real tokens (exclude padding)
-                        # For ESMC, we include all tokens including special tokens 
-                        # since they're meaningful for the protein representation
-                        seq_acts = v[j, :seq_len]
+                    for j, tokens in enumerate(batch_tokens):
+                        seq_len = len(tokens)
+                        
+                        # Determine start and end indices based on whether to include special tokens
+                        start_idx = 0 if include_special_tokens else 1
+                        end_idx = seq_len if include_special_tokens else seq_len - 1
+                        
+                        # Get activations for the specified token range
+                        # For ESMC, tokens include BOS and EOS special tokens
+                        seq_acts = v[j, start_idx:end_idx]
                         all_activations[k].append(seq_acts)
         
         # Remove hooks
@@ -171,7 +187,9 @@ class ESMCInterpreter:
         epochs: int = 10,
         batch_size: int = 256,
         lr: float = 1e-3,
-        save_path: Optional[str] = None
+        save_path: Optional[str] = None,
+        use_wandb: bool = False,
+        wandb_prefix: str = ""
     ) -> Dict[str, List[float]]:
         """
         Train an autoencoder for a specific layer.
@@ -184,6 +202,8 @@ class ESMCInterpreter:
             batch_size: Training batch size
             lr: Learning rate
             save_path: Path to save the trained autoencoder
+            use_wandb: Whether to log metrics to Weights & Biases
+            wandb_prefix: Prefix for wandb metric names
             
         Returns:
             Dictionary of training metrics
@@ -203,6 +223,18 @@ class ESMCInterpreter:
         dataloader = torch.utils.data.DataLoader(
             dataset, batch_size=batch_size, shuffle=True
         )
+        
+        # Import wandb only if needed (to avoid dependency requirement when not using it)
+        if use_wandb:
+            try:
+                import wandb
+            except ImportError:
+                print("wandb not installed. Run 'pip install wandb' to enable wandb logging.")
+                use_wandb = False
+        
+        # Add prefix with trailing slash if provided
+        if wandb_prefix and not wandb_prefix.endswith('/'):
+            wandb_prefix = wandb_prefix + '/'
         
         for epoch in range(epochs):
             epoch_metrics = defaultdict(float)
@@ -232,7 +264,14 @@ class ESMCInterpreter:
             for k, v in epoch_metrics.items():
                 avg_v = v / n_batches
                 metrics[k].append(avg_v)
-                
+            
+            # Log to wandb if enabled
+            if use_wandb:
+                wandb_metrics = {f"{wandb_prefix}{k}": v for k, v in metrics.items()}
+                # Add epoch information to metrics
+                wandb_metrics[f"{wandb_prefix}epoch"] = epoch
+                wandb.log(wandb_metrics)
+            
             print(f"Epoch {epoch+1}: recon_loss={metrics['reconstruction'][-1]:.4f}, "
                   f"sparsity={metrics['sparsity'][-1]:.4f}")
         
@@ -244,115 +283,3 @@ class ESMCInterpreter:
             
         return dict(metrics)
     
-    def interpret_features(
-        self,
-        layer_idx: int,
-        component: str = 'mlp',
-        feature_indices: Optional[List[int]] = None,
-        top_k: int = 10,
-        sample_inputs: Optional[List[str]] = None,
-        visualize: bool = True,
-    ) -> Dict:
-        """
-        Interpret the learned features in a trained autoencoder.
-        
-        Args:
-            layer_idx: Layer index
-            component: Component type
-            feature_indices: Indices of features to interpret (default: top features by importance)
-            top_k: Number of top features to interpret
-            sample_inputs: Sample sequences to find activating examples
-            visualize: Whether to create plots
-            
-        Returns:
-            Dictionary with interpretation results
-        """
-        key = f"{component}_{layer_idx}"
-        
-        if key not in self.autoencoders:
-            raise ValueError(f"No trained autoencoder for {key}")
-            
-        autoencoder = self.autoencoders[key]
-        
-        # Get feature importance
-        feature_importance = autoencoder.get_feature_importance()
-        
-        # Select features to interpret
-        if feature_indices is None:
-            # Use top-k features by importance
-            _, feature_indices = torch.topk(feature_importance, top_k)
-            feature_indices = feature_indices.tolist()
-        
-        # Results dictionary
-        results = {
-            "feature_importance": feature_importance.cpu().numpy(),
-            "interpreted_features": {}
-        }
-        
-        # Analyze decoder weights for each feature
-        for idx in feature_indices:
-            # Get decoder weights for this feature
-            decoder_weights = autoencoder.decoder.weight[:, idx].cpu().detach()
-            
-            feature_result = {
-                "importance": feature_importance[idx].item(),
-                "decoder_weights": decoder_weights.numpy(),
-            }
-            
-            results["interpreted_features"][idx] = feature_result
-            
-            # Find activating examples if sample inputs provided
-            if sample_inputs and len(sample_inputs) > 0:
-                # Collect activations for these samples
-                sample_activations = self.collect_activations(
-                    sample_inputs, 
-                    layer_indices=[layer_idx],
-                    component=component
-                )
-                
-                layer_key = f"layer_{layer_idx}_{component}"
-                if layer_key in sample_activations:
-                    acts = sample_activations[layer_key]
-                    
-                    # Find top activating examples
-                    top_inputs, top_values = autoencoder.get_top_activating_inputs(
-                        acts, idx, top_k=5
-                    )
-                    
-                    feature_result["top_activating_examples"] = {
-                        "inputs": top_inputs.cpu().numpy(),
-                        "activations": top_values.cpu().numpy()
-                    }
-        
-        # Create visualizations if requested
-        if visualize:
-            self._visualize_features(results, layer_idx, component)
-            
-        return results
-    
-    def _visualize_features(self, results, layer_idx, component):
-        """Create visualizations for interpreted features."""
-        plt.figure(figsize=(12, 8))
-        
-        # Plot feature importance
-        importance = results["feature_importance"]
-        plt.subplot(2, 1, 1)
-        plt.bar(range(len(importance)), importance)
-        plt.title(f"Feature Importance for {component} Layer {layer_idx}")
-        plt.xlabel("Feature Index")
-        plt.ylabel("Importance (L2 Norm)")
-        
-        # Plot decoder weights for top features
-        plt.subplot(2, 1, 2)
-        for idx, feature_data in list(results["interpreted_features"].items())[:5]:
-            plt.plot(feature_data["decoder_weights"], label=f"Feature {idx}")
-        
-        plt.title("Decoder Weights for Top Features")
-        plt.xlabel("Input Dimension")
-        plt.ylabel("Weight Value")
-        plt.legend()
-        plt.tight_layout()
-        
-        # Save or show the plot
-        plt.savefig(f"esmc_sae_{component}_layer{layer_idx}_features.png")
-        plt.close() 
